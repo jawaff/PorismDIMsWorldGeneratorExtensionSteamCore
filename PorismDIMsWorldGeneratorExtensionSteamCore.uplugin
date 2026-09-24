@@ -26,10 +26,6 @@
 			"Enabled": true
 		},
 		{
-			"Name": "PorismDIMsWorldGeneratorExtension",
-			"Enabled": true
-		},
-		{
 			"Name": "SteamCorePro",
 			"Enabled": true
 		}
