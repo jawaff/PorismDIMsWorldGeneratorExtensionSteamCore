@@ -2,7 +2,8 @@
 
 #include "PorismDIMsWorldGeneratorExtensionSteamCore.h"
 
-#include "ChunkWorldExtended/ChunkWorldNetManager.h"
+#include "ChunkWorldExtended/ChunkWorldNetworkSubsystem.h"
+#include "SteamCoreSocketsNetDriver.h"
 #include "ChunkWorldExtended/ChunkWorldNetTransport.h"
 #include "Engine/Engine.h"
 #include "Misc/ConfigCacheIni.h"
@@ -19,7 +20,6 @@ DEFINE_LOG_CATEGORY(LogPorismDIMsWorldGeneratorExtensionSteamCore);
 
 namespace
 {
-	static constexpr int32 DefaultSteamVirtualPort = 7878;
 	static constexpr float ConnectTimeoutSeconds = 10.0f;
 	static constexpr float PollSleepSeconds = 0.01f;
 	static bool bInstalledSteamTransportFactory = false;
@@ -33,7 +33,7 @@ namespace
 
 		bool IsValid() const
 		{
-			return SteamId != 0 && VirtualPort >= 0;
+			return SteamId != 0 && VirtualPort > 0 && VirtualPort <= 65535;
 		}
 	};
 
@@ -64,35 +64,12 @@ namespace
 			return false;
 		}
 
-		OutSteamId = FCString::Strtoui64(*Normalized, nullptr, 10);
-		return OutSteamId != 0;
-	}
-
-	static FString ExtractSteamConnectToken(const FString& RawAddress)
-	{
-		TArray<FString> Segments;
-		RawAddress.ParseIntoArray(Segments, TEXT(":"), false);
-		for (int32 Index = Segments.Num() - 2; Index >= 0; --Index)
-		{
-			uint64 SteamId = 0;
-			if (ParseSteamIdentitySegment(Segments[Index], SteamId) && IsAllDigits(Segments[Index + 1]))
-			{
-				return FString::Printf(TEXT("%llu:%s"), SteamId, *Segments[Index + 1]);
-			}
-		}
-
-		uint64 SteamId = 0;
-		if (ParseSteamIdentitySegment(RawAddress, SteamId))
-		{
-			return FString::Printf(TEXT("%llu"), SteamId);
-		}
-
-		return RawAddress;
+		return Normalized.Len() <= 20 && LexTryParseString(OutSteamId, *Normalized) && OutSteamId != 0;
 	}
 
 	static bool ParseSteamConnectToken(const FString& RawAddress, FParsedSteamConnectToken& OutToken)
 	{
-		const FString ConnectToken = ExtractSteamConnectToken(RawAddress);
+		const FString& ConnectToken = RawAddress;
 		FString SteamIdString;
 		FString VirtualPortString;
 		if (!ConnectToken.Split(TEXT(":"), &SteamIdString, &VirtualPortString, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
@@ -107,33 +84,7 @@ namespace
 		}
 
 		OutToken.SteamId = SteamId;
-		OutToken.VirtualPort = FCString::Atoi(*VirtualPortString);
-		return OutToken.IsValid();
-	}
-
-	static int32 ResolveSteamVirtualPort()
-	{
-		if (GEngine)
-		{
-			for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
-			{
-				if (WorldContext.WorldType != EWorldType::Game && WorldContext.WorldType != EWorldType::PIE)
-				{
-					continue;
-				}
-
-				if (UWorld* World = WorldContext.World())
-				{
-					const int32 BasePort = World->URL.Port + 100;
-					if (BasePort > 0)
-					{
-						return BasePort;
-					}
-				}
-			}
-		}
-
-		return DefaultSteamVirtualPort;
+		return VirtualPortString.Len() <= 5 && LexTryParseString(OutToken.VirtualPort, *VirtualPortString) && OutToken.IsValid();
 	}
 
 	class FPorismSteamSocketsTransport final : public IChunkWorldNetTransport
@@ -278,8 +229,9 @@ namespace
 			}
 
 			const double Deadline = FPlatformTime::Seconds() + TimeoutSeconds;
-			while (FPlatformTime::Seconds() < Deadline && IsConnected())
+			do
 			{
+				PumpReceivedMessages();
 				{
 					FScopeLock Lock(&ReceiveMutex);
 					if (HasQueuedBytes())
@@ -288,11 +240,8 @@ namespace
 					}
 				}
 
-				if (!PumpReceivedMessages())
-				{
-					FPlatformProcess::SleepNoStats(PollSleepSeconds);
-				}
-			}
+				if (TimeoutSeconds > 0.0f) FPlatformProcess::SleepNoStats(PollSleepSeconds);
+			} while (FPlatformTime::Seconds() < Deadline && IsConnected());
 
 			return false;
 		}
@@ -456,6 +405,8 @@ namespace
 		, public TSharedFromThis<FPorismSteamSocketsTransportFactory>
 	{
 	public:
+		explicit FPorismSteamSocketsTransportFactory(int32 InVirtualPort) : VirtualPort(InVirtualPort) {}
+
 		virtual ~FPorismSteamSocketsTransportFactory() override
 		{
 			StopListening();
@@ -481,7 +432,6 @@ namespace
 				return false;
 			}
 
-			VirtualPort = ResolveSteamVirtualPort();
 			ListenSocket = SocketInterface->CreateListenSocketP2P(VirtualPort, 0, nullptr);
 			if (ListenSocket == k_HSteamListenSocket_Invalid)
 			{
@@ -510,7 +460,6 @@ namespace
 
 			ListenSocket = k_HSteamListenSocket_Invalid;
 			ConnectionAddress.Empty();
-			VirtualPort = 0;
 		}
 
 		virtual FString GetConnectionAddress() const override
@@ -652,8 +601,13 @@ void FPorismDIMsWorldGeneratorExtensionSteamCoreModule::StartupModule()
 	FModuleManager::LoadModuleChecked<IModuleInterface>("PorismDIMsWorldGenerator");
 	FModuleManager::LoadModuleChecked<IModuleInterface>("SteamCoreSockets");
 
-	FPorismSteamSocketsEventRouter::Get().Startup();
-	AChunkWorldNetManager::SetTransportFactory(MakeShared<FPorismSteamSocketsTransportFactory>());
+	UChunkWorldNetworkSubsystem::RegisterProvider(TEXT("Steam"),
+        [](const UNetDriver& Driver) { return Driver.IsA<USteamCoreSocketsNetDriver>(); },
+        [](int32 Port) -> TSharedPtr<IChunkWorldNetTransportFactory>
+        {
+            FPorismSteamSocketsEventRouter::Get().Startup();
+            return MakeShared<FPorismSteamSocketsTransportFactory>(Port);
+        });
 	bInstalledSteamTransportFactory = true;
 
 	UE_LOG(LogPorismDIMsWorldGeneratorExtensionSteamCore, Log, TEXT("Porism Steam transport bridge started."));
@@ -663,7 +617,7 @@ void FPorismDIMsWorldGeneratorExtensionSteamCoreModule::ShutdownModule()
 {
 	if (bInstalledSteamTransportFactory)
 	{
-		AChunkWorldNetManager::SetTransportFactory(nullptr);
+		UChunkWorldNetworkSubsystem::UnregisterProvider(TEXT("Steam"));
 		FPorismSteamSocketsEventRouter::Get().Shutdown();
 		bInstalledSteamTransportFactory = false;
 	}
