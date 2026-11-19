@@ -25,8 +25,13 @@ public class PorismDIMsWorldGeneratorExtensionSteamCore : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"Projects",
+			"NetCommon",
+			"NetCore",
+			"PacketHandler",
 			"SteamLibrary"
 		});
+
+		// The driver exposes its Steam socket but not its handle or receive poll group.
+		PrivateIncludePaths.Add(System.IO.Path.Combine(GetModuleDirectory("SteamCoreSockets"), "Private"));
 	}
 }

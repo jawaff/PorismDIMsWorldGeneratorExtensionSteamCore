@@ -22,4 +22,17 @@ public:
 	 * Releases the project-owned Steam transport factory on shutdown.
 	 */
 	virtual void ShutdownModule() override;
+
+	/** Host policy for newly created Steam listeners, set on the game thread before hosting.
+	 * Zero keeps the provider port; values outside 1..65535 fail the bind. Never overrides a joining client's endpoint. */
+	void SetHostVirtualPortOverride(int32 Port)
+	{
+		check(IsInGameThread());
+		HostVirtualPortOverride = Port;
+	}
+
+private:
+	TWeakObjectPtr<class UNetDriver> GameplayForFactory;
+	int32 HostVirtualPortOverride = 0;
+	bool bInstalledSteamTransportFactory = false;
 };
